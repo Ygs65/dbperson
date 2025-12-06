@@ -12,27 +12,85 @@ import Redis from 'ioredis';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// ===== Redis 連線 =====
-// 優先使用環境變數 REDIS_URL（Render Key-Value Internal URL），沒有時改用本機 127.0.0.1:6379
+// ===== Redis / In-Memory Storage Wrapper =====
+// 優先使用環境變數 REDIS_URL，沒有時改用本機 127.0.0.1:6379
+// 若 Redis 連線失敗，自動降級為 In-Memory 模式
 const redisUrl = process.env.REDIS_URL || 'redis://127.0.0.1:6379';
-const redis = new Redis(redisUrl);
+let useRedis = true;
+let redis = new Redis(redisUrl, {
+  retryStrategy: (times) => {
+    if (times > 3) {
+      console.log('[Redis] Connection failed too many times. Switching to In-Memory mode.');
+      useRedis = false;
+      return null;
+    }
+    return Math.min(times * 100, 2000);
+  }
+});
 
 redis.on('connect', () => {
   console.log('[Redis] connected to', redisUrl);
+  useRedis = true;
 });
 
 redis.on('error', (err) => {
-  console.error('[Redis] error:', err);
+  console.error('[Redis] error:', err.message);
+  // 若連線錯誤，暫時標記不使用 Redis (但在 retry 期間可能還會嘗試)
 });
 
-// ===== 開發者 root 設定 =====
-const ROOT_USER = 'root';
-// ⚠ 請在啟動前用環境變數設定 ROOT_PASSWORD，一旦設定就視為「不可更改」
-// 例如：ROOT_PASSWORD=yourpass npm start
-const ROOT_PASSWORD = process.env.ROOT_PASSWORD || '';
+// In-Memory Fallback Storage
+const memoryStore = new Map();
 
-if (!ROOT_PASSWORD) {
-  console.warn('[WARN] ROOT_PASSWORD 未設定，root 開發者刪除房間功能將無法使用。');
+async function dbGet(key) {
+  if (useRedis) {
+    try { return await redis.get(key); } catch (e) { useRedis = false; }
+  }
+  return memoryStore.get(key) || null;
+}
+
+async function dbSet(key, value) {
+  if (useRedis) {
+    try { return await redis.set(key, value); } catch (e) { useRedis = false; }
+  }
+  memoryStore.set(key, value);
+  return 'OK';
+}
+
+async function dbDel(key) {
+  if (useRedis) {
+    try { return await redis.del(key); } catch (e) { useRedis = false; }
+  }
+  const existed = memoryStore.has(key);
+  memoryStore.delete(key);
+  return existed ? 1 : 0;
+}
+
+async function dbExists(key) {
+  if (useRedis) {
+    try { return await redis.exists(key); } catch (e) { useRedis = false; }
+  }
+  return memoryStore.has(key) ? 1 : 0;
+}
+
+async function dbMGet(...keys) {
+  if (useRedis) {
+    try { return await redis.mget(...keys); } catch (e) { useRedis = false; }
+  }
+  return keys.map(k => memoryStore.get(k) || null);
+}
+
+// 模擬 keys (簡單實作，效能不佳但夠用)
+async function dbKeys(pattern) {
+  if (useRedis) {
+    try { return await redis.keys(pattern); } catch (e) { useRedis = false; }
+  }
+  // 簡易 glob matching: 只支援 * 在最後或沒有 *
+  const prefix = pattern.replace('*', '');
+  const result = [];
+  for (const k of memoryStore.keys()) {
+    if (k.startsWith(prefix)) result.push(k);
+  }
+  return result;
 }
 
 // ===== Express / Socket.IO =====
@@ -45,6 +103,7 @@ const io = new SocketIOServer(server, {
 });
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
 
 // 靜態檔案：直接把整個專案資料夾當靜態目錄
 app.use(express.static(__dirname));
@@ -59,8 +118,7 @@ const ROOM_SETTINGS_KEY = (roomId) => `room:${roomId}:settings`;
 const ROOM_EXAM_KEY = (roomId) => `room:${roomId}:exam`;
 const BANK_KEY = (roomId, bankId) => `bank:${roomId}:${bankId}`;
 
-// 排行榜、個人成績、錯題本 Redis Key
-const LEADER_KEY = 'leaderboard:global';
+// 個人成績、錯題本 Redis Key (排行榜已移除)
 const USER_STATS_KEY = (userId) => `user:${userId}:stats`;
 const USER_WRONG_KEY = (userId) => `user:${userId}:wrongbook`;
 
@@ -72,10 +130,10 @@ function shuffle(arr) {
   }
 }
 
-// 從 Redis 讀題庫 (R1: 整包 JSON 字串)
+// 從 DB 讀題庫 (R1: 整包 JSON 字串)
 async function loadBankQuestions(roomId, bankId) {
   const key = BANK_KEY(roomId, bankId);
-  const json = await redis.get(key);
+  const json = await dbGet(key);
   if (!json) return [];
   try {
     const obj = JSON.parse(json);
@@ -96,16 +154,16 @@ async function saveBank(roomId, bankId, name, questions) {
     name: name || bankId,
     questions
   };
-  await redis.set(key, JSON.stringify(payload));
+  await dbSet(key, JSON.stringify(payload));
 }
 
 // 列出房間所有題庫（只看 bank:{roomId}:*）
 async function listBanksForRoom(roomId) {
   const pattern = BANK_KEY(roomId, '*');
-  const keys = await redis.keys(pattern);
+  const keys = await dbKeys(pattern);
   const result = [];
   for (const k of keys) {
-    const json = await redis.get(k);
+    const json = await dbGet(k);
     if (!json) continue;
     try {
       const obj = JSON.parse(json);
@@ -234,29 +292,20 @@ app.post('/api/exam_result', async (req, res) => {
     };
 
     // 1) 存「我的成績」
-    await redis.set(USER_STATS_KEY(playerId), JSON.stringify(stats));
+    await dbSet(USER_STATS_KEY(playerId), JSON.stringify(stats));
 
     // 2) 累積「我的錯題本」
     if (Array.isArray(wrongQuestions) && wrongQuestions.length > 0) {
       let merged = [];
-      const existed = await redis.get(USER_WRONG_KEY(playerId));
+      const existed = await dbGet(USER_WRONG_KEY(playerId));
       if (existed) {
         try { merged = JSON.parse(existed) || []; } catch (e) { merged = []; }
       }
       merged = merged.concat(wrongQuestions);
-      await redis.set(USER_WRONG_KEY(playerId), JSON.stringify(merged));
+      await dbSet(USER_WRONG_KEY(playerId), JSON.stringify(merged));
     }
 
-    // 3) 更新排行榜（Sorted Set）
-    await redis.zadd(LEADER_KEY, score || 0, String(playerId));
-
-    // 4) 廣播最新排行榜
-    try {
-      const top = await redis.zrevrange(LEADER_KEY, 0, 9, 'WITHSCORES');
-      io.emit('leaderboard_update', top || []);
-    } catch (e) {
-      console.error('[leaderboard] refresh failed', e);
-    }
+    // 3) 排行榜已移除，不執行 zadd / zrevrange
 
     res.json({ ok: true });
   } catch (err) {
@@ -280,7 +329,7 @@ io.on('connection', (socket) => {
     let wrongQuestions = [];
 
     try {
-      const [statsRaw, wrongRaw] = await redis.mget(
+      const [statsRaw, wrongRaw] = await dbMGet(
         USER_STATS_KEY(id),
         USER_WRONG_KEY(id)
       );
@@ -301,13 +350,7 @@ io.on('connection', (socket) => {
       wrongQuestions
     });
 
-    // 初次登入時，也送一份排行榜
-    try {
-      const top = await redis.zrevrange(LEADER_KEY, 0, 9, 'WITHSCORES');
-      socket.emit('leaderboard_update', top || []);
-    } catch (e) {
-      console.error('[login] load leaderboard failed:', e);
-    }
+    // 排行榜已移除，不發送 leaderboard_update
   });
 
   // ---- 建立房間 ----
@@ -317,7 +360,7 @@ io.on('connection', (socket) => {
       return;
     }
     const settingsKey = ROOM_SETTINGS_KEY(roomId);
-    const exists = await redis.exists(settingsKey);
+    const exists = await dbExists(settingsKey);
     if (exists) {
       socket.emit('create_room_ack', { ok: false, error: 'room_exists', roomId });
       return;
@@ -329,7 +372,7 @@ io.on('connection', (socket) => {
       hostId,
       createdAt: Date.now()
     };
-    await redis.set(settingsKey, JSON.stringify(settings));
+    await dbSet(settingsKey, JSON.stringify(settings));
 
     socket.join(roomId);
     socket.data.currentRoom = roomId;
@@ -344,7 +387,7 @@ io.on('connection', (socket) => {
       return;
     }
     const settingsKey = ROOM_SETTINGS_KEY(roomId);
-    const exists = await redis.exists(settingsKey);
+    const exists = await dbExists(settingsKey);
     if (!exists) {
       socket.emit('join_error', { error: 'room_not_found', roomId });
       return;
@@ -389,7 +432,7 @@ io.on('connection', (socket) => {
       return;
     }
     const key = BANK_KEY(roomId, bankId);
-    const delCount = await redis.del(key);
+    const delCount = await dbDel(key);
     if (delCount === 0) {
       socket.emit('delete_bank_ack', { ok: false, error: 'not_found', bankId });
     } else {
@@ -437,16 +480,16 @@ io.on('connection', (socket) => {
     });
   });
 
-  // ---- 啟動房間多題測驗 ----
+  // ---- 啟動房間多題測驗 (自動開始/共同競賽) ----
   socket.on('start_room_exam', async (payload) => {
-    const { roomId, bankId, questionCount, timeLimitMinutes } = payload || {};
+    let { roomId, bankId, questionCount, timeLimitMinutes } = payload || {};
     if (!roomId || !bankId) {
       socket.emit('room_exam_ack', { ok: false, error: 'bad_request' });
       return;
     }
 
     const settingsKey = ROOM_SETTINGS_KEY(roomId);
-    const settingsJson = await redis.get(settingsKey);
+    const settingsJson = await dbGet(settingsKey);
     let settings = {};
     if (settingsJson) {
       try { settings = JSON.parse(settingsJson); } catch {}
@@ -463,7 +506,15 @@ io.on('connection', (socket) => {
       return;
     }
 
-    const max = Math.min(questionCount || allQuestions.length, allQuestions.length);
+    // 自動開始預設值：若未指定，則使用全部題目(最多50)，時間10分鐘
+    if (!questionCount || questionCount <= 0) {
+      questionCount = Math.min(50, allQuestions.length);
+    }
+    if (!timeLimitMinutes || timeLimitMinutes <= 0) {
+      timeLimitMinutes = 10;
+    }
+
+    const max = Math.min(questionCount, allQuestions.length);
     const indices = allQuestions.map((_, idx) => idx);
     shuffle(indices);
     const picked = indices.slice(0, max).map(i => allQuestions[i]);
@@ -475,7 +526,7 @@ io.on('connection', (socket) => {
       timeLimitMinutes,
       createdAt: Date.now()
     };
-    await redis.set(ROOM_EXAM_KEY(roomId), JSON.stringify(examInfo));
+    await dbSet(ROOM_EXAM_KEY(roomId), JSON.stringify(examInfo));
 
     io.to(roomId).emit('room_event', {
       type: 'session_start',
@@ -488,82 +539,6 @@ io.on('connection', (socket) => {
 
     socket.emit('room_exam_ack', { ok: true, roomId, bankId });
   });
-
-  // ---- 新增：刪除房間（只有房主或 root 開發者可以） ----
-  socket.on('delete_room', async ({ roomId, devPassword }) => {
-    try {
-      if (!roomId) {
-        socket.emit('delete_room_ack', { ok: false, error: 'bad_request' });
-        return;
-      }
-
-      const settingsKey = ROOM_SETTINGS_KEY(roomId);
-      const exists = await redis.exists(settingsKey);
-      if (!exists) {
-        socket.emit('delete_room_ack', { ok: false, error: 'not_found', roomId });
-        return;
-      }
-
-      let settings = {};
-      const settingsJson = await redis.get(settingsKey);
-      if (settingsJson) {
-        try { settings = JSON.parse(settingsJson); } catch {}
-      }
-
-      const currentUserId = socket.data?.userId || socket.id;
-      const isHost = settings.hostId && settings.hostId === currentUserId;
-      const isDev =
-        currentUserId === ROOT_USER &&
-        ROOT_PASSWORD &&
-        typeof devPassword === 'string' &&
-        devPassword === ROOT_PASSWORD;
-
-      if (!isHost && !isDev) {
-        socket.emit('delete_room_ack', { ok: false, error: 'no_permission', roomId });
-        return;
-      }
-
-      const patterns = [`room:${roomId}:*`, `bank:${roomId}:*`];
-      let allKeys = [];
-      for (const p of patterns) {
-        const ks = await redis.keys(p);
-        allKeys = allKeys.concat(ks);
-      }
-
-      let delCount = 0;
-      if (allKeys.length > 0) {
-        delCount = await redis.del(allKeys);
-      }
-
-      // 對該房間所有人廣播房間已被刪除
-      io.to(roomId).emit('room_event', {
-        type: 'room_deleted',
-        roomId
-      });
-
-      // 讓 socket 離開房間（只對目前這個連線）
-      socket.leave(roomId);
-      if (socket.data.currentRoom === roomId) {
-        socket.data.currentRoom = null;
-      }
-
-      socket.emit('delete_room_ack', {
-        ok: true,
-        roomId,
-        deletedKeys: delCount
-      });
-    } catch (e) {
-      console.error('[delete_room] error:', e);
-      socket.emit('delete_room_ack', { ok: false, error: 'server_error' });
-    }
-  });
-
-  // ---- 排行榜（簡單 stub）----
-  const LEADER_KEY = 'leaderboard:global';
-  (async () => {
-    const top = await redis.zrevrange(LEADER_KEY, 0, 9, 'WITHSCORES');
-    socket.emit('leaderboard_update', top || []);
-  })();
 
   socket.on('disconnect', () => {
     console.log('client disconnected', socket.id);
